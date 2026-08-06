@@ -1,6 +1,11 @@
 
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
+import { loadProxyConfig } from "../../src/config/manager";
 import { transformToGoogleBody, transformGoogleEventToOpenAI } from "../../src/utils/transform";
+
+beforeAll(async () => {
+  await loadProxyConfig();
+});
 
 describe("Unit Tests: transformToGoogleBody", () => {
   test("Basic message transformation", () => {
@@ -41,6 +46,24 @@ describe("Unit Tests: transformToGoogleBody", () => {
     const result = transformToGoogleBody(openaiBody, "p", true, "us-central1"); // isCli = true
     expect(result.model).toBe("gemini-3-flash-preview");
     expect(result.request.generationConfig.thinkingConfig.thinkingLevel).toBe("medium");
+  });
+
+  test("Gemini 3.6 Flash uses thinkingLevel without a conflicting budget", () => {
+    const openaiBody = {
+      model: "antigravity-gemini-3.6-flash-high",
+      messages: [{ role: "user", content: "Hi" }]
+    };
+
+    const result = transformToGoogleBody(openaiBody, "p", false, "us-central1");
+
+    // Preserve the dynamically advertised base model while treating the suffix
+    // as the thinking level instead of part of the upstream model ID.
+    expect(result.model).toBe("gemini-3.6-flash");
+    expect(result.request.generationConfig.thinkingConfig).toEqual({
+      includeThoughts: true,
+      thinkingLevel: "high"
+    });
+    expect(result.request.generationConfig.thinkingConfig.thinkingBudget).toBeUndefined();
   });
 
   test("Multi-turn conversation", () => {

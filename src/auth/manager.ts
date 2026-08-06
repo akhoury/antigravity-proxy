@@ -311,13 +311,25 @@ export function parseDuration(val: string): number {
   return amount * multipliers[match[2]];
 }
 
-export function flagModelUnsupported(email: string, model: string) {
+export function shouldFlagModelUnsupported(requestedModel: string, targetModel: string): boolean {
+    const normalize = (model: string) => model
+        .toLowerCase()
+        .replace(/^(openai|antigravity|custom_openai|litellm|google)\//i, "")
+        .replace(/^antigravity-/i, "")
+        .replace(/^gemini-claude-/i, "claude-");
+    return normalize(requestedModel) === normalize(targetModel);
+}
+
+export function flagModelUnsupported(email: string, requestedModel: string, targetModel: string): boolean {
+    // A transformed target returning 404 can indicate a proxy mapping bug.
+    if (!shouldFlagModelUnsupported(requestedModel, targetModel)) return false;
+
     const account = accounts.find(a => a.email === email);
-    if (account) {
-        if (!account.capabilities) account.capabilities = {};
-        account.capabilities[model] = false;
-        saveAccounts(accounts);
-    }
+    if (!account) return false;
+    if (!account.capabilities) account.capabilities = {};
+    account.capabilities[requestedModel] = false;
+    saveAccounts(accounts);
+    return true;
 }
 
 export async function resetAccount(email: string) {
@@ -328,6 +340,7 @@ export async function resetAccount(email: string) {
         account.cooldowns = {};
         account.modelScores = {};
         account.history = [];
+        account.capabilities = {};
         delete account.challenge;
         const keysToDelete = [];
         for (const [key] of cooldownMap) {

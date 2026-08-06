@@ -13,6 +13,7 @@ import { transformToGoogleBody, transformGoogleEventToOpenAI, createOpenAIStream
 import { getImpersonationHeaders, getGeminiCliHeaders, generateFingerprint } from "./utils/headers";
 import { refreshAllQuotas, fetchQuota, supportedModelsCache } from "./api/quota";
 import { parseGoogleError } from "./utils/errors";
+import { shouldRetryWithAggressiveSchema } from "./utils/schema";
 
 const logBuffer: string[] = [];
 const MAX_LOGS = 200;
@@ -44,6 +45,15 @@ console.warn = (...args) => { originalWarn(...args); captureLog('warn', args); }
 await initManager();
 
 const proxyConfig = getProxyConfig();
+
+let globalFetchLock = Promise.resolve();
+async function acquireFetchLock(spacingMs: number): Promise<void> {
+    const prevLock = globalFetchLock;
+    let release!: () => void;
+    globalFetchLock = prevLock.then(() => new Promise<void>(r => { release = r; }));
+    await prevLock;
+    setTimeout(release, spacingMs);
+}
 
 setInterval(refreshAllQuotas, proxyConfig.quota.refreshIntervalMs);
 // Initial quota refresh on startup
@@ -152,25 +162,13 @@ Bun.serve({
             if (attempts > 1) {
                 const delayMs = Math.min(500 * attempts, 3000);
                 await new Promise(r => setTimeout(r, delayMs));
-                
-                if (!isSandboxOnlyModel && !isCliOnlyModel && lastStatus !== 503) {
-                    useCliPool = !useCliPool;
-                    console.log(`[Switch] Switching to ${useCliPool ? 'CLI' : 'Sandbox'} pool for attempt ${attempts}`);
-                } else {
-                    console.log(`[Switch] Skipping pool switch for ${isCliOnlyModel ? 'CLI-only' : 'sandbox-only'} model (attempt ${attempts})`);
-                }
+                console.log(`[Switch] Retrying attempt ${attempts} in ${useCliPool ? 'CLI' : 'Sandbox'} pool.`);
             }
 
             let account = await getBestAccount(useCliPool ? "cli" : "sandbox", openaiBody.model, clientId, triedEmails, true);
             
-            if (!account && !isSandboxOnlyModel && !isCliOnlyModel) {
-                console.log(`[Manager] No READY accounts in ${useCliPool ? 'CLI' : 'Sandbox'} pool, trying the other pool first...`);
-                const otherPool = useCliPool ? "sandbox" : "cli";
-                account = await getBestAccount(otherPool, openaiBody.model, clientId, triedEmails, true);
-                if (account) {
-                    useCliPool = !useCliPool;
-                    console.log(`[Switch] Found ready account in ${useCliPool ? 'CLI' : 'Sandbox'} pool.`);
-                }
+            if (!account) {
+                console.log(`[Manager] No READY accounts in ${useCliPool ? 'CLI' : 'Sandbox'} pool.`);
             }
 
             if (!account) {
@@ -227,10 +225,15 @@ Bun.serve({
           const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
           try {
-            if (config.features.jitterEnabled) {
+            // Apply request spacing to avoid hitting strict concurrency limits
+            const spacingMs = (config.features as any).requestSpacingMs ?? 3000;
+            if (spacingMs > 0) {
+                await acquireFetchLock(spacingMs);
+            } else if (config.features.jitterEnabled) {
               const jitterMs = config.features.jitterMinMs + Math.random() * (config.features.jitterMaxMs - config.features.jitterMinMs);
               await new Promise(r => setTimeout(r, jitterMs));
             }
+            
 
             const googleRes = await fetch(GOOGLE_URL, {
               method: "POST",
@@ -263,9 +266,13 @@ Bun.serve({
                         });
                         continue;
                     } else if (parsedError.isModelUnsupported) {
-                       console.log(`[Model] Unsupported model ${openaiBody.model} for ${account.email}, marking capability.`);
-                       flagModelUnsupported(account.email, openaiBody.model);
-                   }
+                       const flagged = flagModelUnsupported(account.email, openaiBody.model, googleBody.model);
+                       if (flagged) {
+                           console.log("[Model] Unsupported model " + openaiBody.model + " for " + account.email + ", marking capability.");
+                       } else {
+                           console.warn("[Model] Not caching 404 capability for " + openaiBody.model + ": target model was " + googleBody.model + ".");
+                       }
+                    }
                    await updateAccountUsage(account.email, false, openaiBody.model, useCliPool ? "cli" : "sandbox", clientId, status);
                    return new Response(JSON.stringify({ 
                        error: { message: "Access denied: " + parsedError.reason, type: "access_denied", code: status.toString() } 
@@ -308,12 +315,36 @@ Bun.serve({
                 }
 
 
-               if (status === 400 && (errText.toLowerCase().includes("tool schema") || errText.includes("Invalid JSON payload") || errText.toLowerCase().includes("function_declarations")) && !aggressive) {
-                  console.log(`[Schema] Detected tool schema error for ${account.email}, retrying with aggressive cleaning...`);
+               const hasTools = Array.isArray(openaiBody.tools) && openaiBody.tools.length > 0;
+               if (shouldRetryWithAggressiveSchema(status, parsedError.reason, errText, hasTools, aggressive)) {
+                  console.log("[Schema] Retrying " + account.email + " on the same endpoint with aggressive tool-schema cleaning...");
                   aggressive = true;
                   attempts--;
+                  const triedIndex = triedEmails.lastIndexOf(account.email);
+                  if (triedIndex >= 0) triedEmails.splice(triedIndex, 1);
+                  attemptLogs.pop();
                   continue;
                }
+               if (status === 400 && parsedError.reason === "invalid_argument") {
+                  // INVALID_ARGUMENT is request-specific. Rotating accounts/endpoints cannot
+                  // make the same payload valid and may hide it behind a later staging 403.
+                  console.log(`[Request] Non-retryable 400 from ${GOOGLE_URL.split('/')[2]}; returning the original error.`);
+                  return new Response(JSON.stringify({
+                      error: {
+                          message: parsedError.message || "Google API rejected the request.",
+                          type: "invalid_request_error",
+                          code: parsedError.reason
+                      }
+                  }), {
+                      status,
+                      headers: {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*",
+                          "X-Antigravity-Attempts": attempts.toString()
+                      }
+                  });
+               }
+
                aggressive = false;
 
                await updateAccountUsage(account.email, false, openaiBody.model, useCliPool ? "cli" : "sandbox", clientId, status);
@@ -449,17 +480,20 @@ Bun.serve({
            }
       }
 
+      const noUpstreamAttempts = attemptLogs.length === 0;
       const resetTime = getEarliestReset(useCliPool ? "cli" : "sandbox");
-      const resetMsg = resetTime ? ` Next reset in ${resetTime}.` : "";
+      const resetMsg = resetTime ? " Next reset in " + resetTime + "." : "";
       return new Response(JSON.stringify({ 
         error: { 
-            message: `Quota Exhausted: All accounts failed or are exhausted for this model.${resetMsg} Try a different model or wait for quota reset.`,
-            type: "insufficient_quota",
-            code: "insufficient_quota",
+            message: noUpstreamAttempts
+                ? "No eligible accounts were available locally for this model. Reset account state or inspect capability, challenge, cooldown, and soft-quota filters."
+                : "Quota Exhausted: All accounts failed or are exhausted for this model." + resetMsg + " Try a different model or wait for quota reset.",
+            type: noUpstreamAttempts ? "service_unavailable" : "insufficient_quota",
+            code: noUpstreamAttempts ? "no_eligible_accounts" : "insufficient_quota",
             attempts: attemptLogs
         } 
       }), { 
-        status: 429, 
+        status: noUpstreamAttempts ? 503 : 429,
         headers: { 
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
@@ -580,6 +614,7 @@ Bun.serve({
             acc.modelScores = {};
             acc.history = [];
             acc.quota = [];
+            acc.capabilities = {};
             delete acc.challenge;
         }
         

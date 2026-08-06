@@ -1,11 +1,33 @@
 services:
-  proxy:
-    build: .
-    ports:
-      - "3000:3000"
+  antigravity-proxy:
+    image: oven/bun:1
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    working_dir: /app
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
+      - TZ=Asia/Taipei
+      # 保留原廠的關鍵環境變數
       - ACCOUNTS_FILE=/app/data/antigravity-accounts.json
       - BASE_URL=http://127.0.0.1:3000
+    ports:
+      # 避開 3000 port 衝突
+      - "3001:3000"
     volumes:
+      # 1. 掛載本地 Source Code，修改後直接生效
+      - .:/app
+      # 2. 保留帳號認證資料 (最關鍵)，帶有 :z SELinux 權限標記
       - ./data:/app/data:z
-    restart: unless-stopped
+      # 3. 防止本地 node_modules 與容器內套件發生架構衝突
+      - /app/node_modules
+      # 4. Bun 套件快取
+      - bun-cache:/root/.bun
+    # 啟動時自動安裝/更新依賴並執行
+    command: sh -c "bun install && bun run start"
+
+volumes:
+  bun-cache:
+
+

@@ -160,7 +160,8 @@ export function transformToGoogleBody(
        
        if (isNative) {
            if (baseModel.includes("gemini-3.1-pro")) {
-               googleModel = `gemini-3.1-pro-${extractedTier || "high"}`;
+               const tier = extractedTier || "high";
+               googleModel = tier === "high" ? "gemini-pro-agent" : "gemini-3.1-pro-" + tier;
            } else if (baseModel.includes("gemini-3-pro")) {
                // Respect extracted tier for Gemini 3 Pro, fallback to high
                googleModel = `gemini-3-pro-${extractedTier || "high"}`;
@@ -206,8 +207,16 @@ export function transformToGoogleBody(
         response: responseObj
       };
       
-      if (googleModel.includes("claude") || googleModel.includes("gemini-3")) {
-          funcResp.id = msg.tool_call_id;
+      let cleanId = msg.tool_call_id;
+      if (cleanId && typeof cleanId === 'string' && cleanId.startsWith("sig:")) {
+          const idParts = cleanId.split(":");
+          if (idParts.length >= 3) {
+              cleanId = idParts.slice(2).join(":");
+          }
+      }
+
+      if (googleModel.includes("claude")) {
+          funcResp.id = cleanId;
       }
 
       parts.push({
@@ -254,12 +263,14 @@ export function transformToGoogleBody(
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           if (tc.function) {
+            let cleanId = tc.id || "";
             let sig = "";
             let callId = tc.id || "";
             if (callId.startsWith("sig:")) {
               const idParts = callId.split(":");
               if (idParts.length >= 3) {
                 sig = idParts[1];
+                cleanId = idParts.slice(2).join(":");
               }
             }
 
@@ -268,8 +279,8 @@ export function transformToGoogleBody(
               args: typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments || "{}") : tc.function.arguments
             };
             
-            if (googleModel.includes("claude") || googleModel.includes("gemini-3")) {
-                funcCall.id = tc.id;
+            if (googleModel.includes("claude")) {
+                funcCall.id = cleanId;
             }
 
             const funcPart: any = {
@@ -362,15 +373,27 @@ You are pair programming with a USER to solve their coding task. The task may re
     sessionId: sessionId || crypto.randomUUID()
   };
 
-  if (isThinkingModel || googleModel.includes("gemini-3")) {
+  const isGemini3Model = rawModel.includes("gemini-3") || googleModel.includes("gemini-3") || googleModel === "gemini-pro-agent";
+  const isFlashModel = rawModel.includes("flash") || googleModel.includes("flash");
+
+  if (isGemini3Model && (!isFlashModel || isThinkingModel)) {
+    // Gemini 3 uses thinkingLevel. The backend rejects a request that also
+    // contains thinkingBudget as INVALID_ARGUMENT.
+    googleRequest.generationConfig.thinkingConfig = {
+      includeThoughts: true,
+      thinkingLevel: extractedTier || "low"
+    };
+  } else if (isThinkingModel) {
     googleRequest.generationConfig.thinkingConfig = {
       includeThoughts: true,
       thinkingBudget: thinkingBudget || 16000
     };
-    
-    if (googleModel.includes("gemini-3")) {
-        googleRequest.generationConfig.thinkingConfig.thinkingLevel = extractedTier || "low";
-    }
+  }
+
+  if (!isCli && googleModel === "gemini-pro-agent") {
+    // Current Antigravity agent requests omit generic Gemini safety and token fields.
+    delete googleRequest.generationConfig.maxOutputTokens;
+    delete googleRequest.safetySettings;
   }
 
   if (openaiBody.tools) {
@@ -384,11 +407,14 @@ You are pair programming with a USER to solve their coding task. The task may re
           funcName = sanitizeFunctionName(funcName);
         }
 
-        let description = t.function.description || "";
+        let description = aggressive ? "" : (t.function.description || "");
         const paramNames = Object.keys(cleanParams.properties || {}).filter(k => k !== "_placeholder");
         if (paramNames.length > 0) {
-          description += ` [Parameters: ${paramNames.join(", ")}]`;
+          const parameterHint = "Parameters: " + paramNames.join(", ");
+          description = description ? description + " [" + parameterHint + "]" : parameterHint;
         }
+        if (!description) description = "Function tool";
+        if (description.length > 1024) description = description.slice(0, 1024);
 
         return {
           name: funcName,

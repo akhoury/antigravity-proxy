@@ -12,6 +12,7 @@ async function main() {
     acc.modelScores = {};
     acc.history = [];
     acc.quota = [];
+    acc.capabilities = {};
     delete acc.challenge;
     console.log(`  - Reset ${acc.email}`);
   }

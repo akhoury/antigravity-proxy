@@ -39,6 +39,15 @@ export function parseGoogleError(body: string): {
     
     if (err) {
       message = err.message;
+      if (typeof err.code === "number") status = err.code;
+
+      if (err.status === "INVALID_ARGUMENT") {
+        reason = "invalid_argument";
+        status = err.code || 400;
+      } else if (err.status === "PERMISSION_DENIED") {
+        reason = "permission_denied";
+        status = err.code || 403;
+      }
       if (err.status === "RESOURCE_EXHAUSTED" || err.message?.includes("quota")) {
         isQuotaExhausted = true;
         reason = "quota_exhausted";
@@ -73,6 +82,11 @@ export function parseGoogleError(body: string): {
             if (detail.metadata?.validation_url) validationUrl = detail.metadata.validation_url;
           }
           
+          if (detail.reason === "SERVICE_DISABLED" || detail.errorInfo?.reason === "SERVICE_DISABLED") {
+            reason = "service_disabled";
+            status = 403;
+          }
+
           if (detail.reason === "RATE_LIMIT_EXCEEDED") {
             isQuotaExhausted = true;
             reason = "quota_exhausted";
@@ -89,5 +103,5 @@ export function parseGoogleError(body: string): {
     }
   }
 
-  return { reason, validationUrl, isQuotaExhausted, isChallengeRequired, isModelUnsupported, status };
+  return { reason, validationUrl, isQuotaExhausted, isChallengeRequired, isModelUnsupported, status, message };
 }
