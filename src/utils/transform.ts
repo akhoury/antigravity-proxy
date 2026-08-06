@@ -32,6 +32,26 @@ export function getOriginalToolName(sanitizedName: string): string | undefined {
   return undefined;
 }
 
+export function sanitizeFunctionResponsePayload(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeFunctionResponsePayload);
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const sanitized: Record<string, any> = {};
+  for (const [key, nestedValue] of Object.entries(value)) {
+    // Gemini 3 reserves "$ref" for references to multimodal response parts.
+    // Ordinary tool results frequently contain JSON Schema/OpenAPI references,
+    // which otherwise trigger a missing displayName validation error.
+    const safeKey = key === "$ref" ? "schemaRef" : key;
+    sanitized[safeKey] = sanitizeFunctionResponsePayload(nestedValue);
+  }
+  return sanitized;
+}
+
 const CLAUDE_MODEL_REGISTRY = [
     "claude-3-7-sonnet-20250219",
     "claude-3-5-sonnet-20241022",
@@ -129,7 +149,9 @@ export function transformToGoogleBody(
       "gemini-3-flash-preview"
   ];
   
-  const isNative = (nativelySupported.includes(googleModel) || nativelySupported.includes(baseModel));
+  const isDynamicGemini3Flash = /^gemini-3(?:\.\d+)?-flash(?:-|$)/.test(baseModel);
+  const isNative = nativelySupported.includes(googleModel) ||
+    nativelySupported.includes(baseModel) || isDynamicGemini3Flash;
 
   if (isCli) {
       if (!googleModel.includes("claude")) {
@@ -186,6 +208,14 @@ export function transformToGoogleBody(
   // Extract system instruction (like plugin)
   const systemMessage = openaiBody.messages.find((m: any) => m.role === "system");
   const otherMessages = openaiBody.messages.filter((m: any) => m.role !== "system");
+  const toolNameByCallId = new Map<string, string>();
+  for (const message of otherMessages) {
+    for (const toolCall of message.tool_calls || []) {
+      if (toolCall?.id && toolCall?.function?.name) {
+        toolNameByCallId.set(toolCall.id, toolCall.function.name);
+      }
+    }
+  }
 
   const contents = otherMessages.map((msg: any) => {
     const parts = [];
@@ -202,8 +232,15 @@ export function transformToGoogleBody(
         responseObj = { result: responseObj };
       }
 
+      responseObj = sanitizeFunctionResponsePayload(responseObj);
+
+      let functionName = msg.name || toolNameByCallId.get(msg.tool_call_id) || "function_result";
+      if (proxyConfig.features.sanitizeToolNames) {
+        functionName = sanitizeFunctionName(functionName);
+      }
+
       const funcResp: any = {
-        name: msg.name || "function_result",
+        name: functionName,
         response: responseObj
       };
       
@@ -275,7 +312,9 @@ export function transformToGoogleBody(
             }
 
             const funcCall: any = {
-              name: tc.function.name,
+              name: proxyConfig.features.sanitizeToolNames
+                ? sanitizeFunctionName(tc.function.name)
+                : tc.function.name,
               args: typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments || "{}") : tc.function.arguments
             };
             
@@ -376,7 +415,7 @@ You are pair programming with a USER to solve their coding task. The task may re
   const isGemini3Model = rawModel.includes("gemini-3") || googleModel.includes("gemini-3") || googleModel === "gemini-pro-agent";
   const isFlashModel = rawModel.includes("flash") || googleModel.includes("flash");
 
-  if (isGemini3Model && (!isFlashModel || isThinkingModel)) {
+  if (isGemini3Model && (!isFlashModel || isThinkingModel || extractedTier !== undefined)) {
     // Gemini 3 uses thinkingLevel. The backend rejects a request that also
     // contains thinkingBudget as INVALID_ARGUMENT.
     googleRequest.generationConfig.thinkingConfig = {

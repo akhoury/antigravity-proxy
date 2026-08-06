@@ -14,6 +14,7 @@ import { getImpersonationHeaders, getGeminiCliHeaders, generateFingerprint } fro
 import { refreshAllQuotas, fetchQuota, supportedModelsCache } from "./api/quota";
 import { parseGoogleError } from "./utils/errors";
 import { shouldRetryWithAggressiveSchema } from "./utils/schema";
+import { assertNonSandboxEndpoint, getNonSandboxEndpoints } from "./utils/endpoints";
 
 const logBuffer: string[] = [];
 const MAX_LOGS = 200;
@@ -141,10 +142,6 @@ Bun.serve({
        const attemptLogs: Array<{ email: string, status: number, reason: string }> = [];
        let systemicErrorCount = 0;
       
-      // GPT and Claude models are Sandbox-preferred. Explicit antigravity- models are also Sandbox-only.
-      const isExplicitAntigravity = modelLower.includes("antigravity-");
-      const isSandboxOnlyModel = modelLower.includes("gpt") || isExplicitAntigravity;
-      const isCliOnlyModel = false;
       const CLAUDE_REGIONS = ["us-central1", "us-east5", "europe-west1"];
       
       const clientId = req.headers.get("x-client-id") || url.searchParams.get("client_id") || "unknown";
@@ -184,17 +181,34 @@ Bun.serve({
                 break;
             }
 
-            const SANDBOX_ENDPOINTS = Array.isArray(config.endpoints.sandbox) ? config.endpoints.sandbox : [config.endpoints.sandbox];
-            const CLI_ENDPOINTS = Array.isArray(config.endpoints.cli) ? config.endpoints.cli : [config.endpoints.cli];
+            let agentEndpoints: string[];
+            let cliEndpoints: string[];
+            try {
+                // The legacy "sandbox" config key now means the agent request pool only.
+                // Actual *.sandbox.googleapis.com hosts are never eligible for a request.
+                agentEndpoints = getNonSandboxEndpoints(config.endpoints.sandbox, "agent");
+                cliEndpoints = getNonSandboxEndpoints(config.endpoints.cli, "CLI");
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.error(message);
+                return new Response(JSON.stringify({
+                    error: { message, type: "configuration_error", code: "no_safe_endpoint" }
+                }), {
+                    status: 503,
+                    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+                });
+            }
             
             let GOOGLE_URL: string;
             if (useCliPool) {
-                const cliEndpointIndex = isClaudeModel ? CLI_ENDPOINTS.length - 1 : Math.min(attempts - 1, CLI_ENDPOINTS.length - 1);
-                GOOGLE_URL = CLI_ENDPOINTS[cliEndpointIndex];
+                const cliEndpointIndex = isClaudeModel ? cliEndpoints.length - 1 : Math.min(attempts - 1, cliEndpoints.length - 1);
+                GOOGLE_URL = cliEndpoints[cliEndpointIndex];
             } else {
-                const sandboxEndpointIndex = Math.min(attempts - 1, SANDBOX_ENDPOINTS.length - 1);
-                GOOGLE_URL = SANDBOX_ENDPOINTS[sandboxEndpointIndex];
+                const agentEndpointIndex = Math.min(attempts - 1, agentEndpoints.length - 1);
+                GOOGLE_URL = agentEndpoints[agentEndpointIndex];
             }
+
+            assertNonSandboxEndpoint(GOOGLE_URL);
 
             if (lastStatus === 503) {
                 console.log(`[Capacity] Retrying account ${account.email} on next endpoint ${GOOGLE_URL.split('/')[2]}...`);
@@ -239,7 +253,9 @@ Bun.serve({
               method: "POST",
               headers: headers,
               body: JSON.stringify(googleBody),
-              signal: controller.signal
+              signal: controller.signal,
+              // Never follow an upstream redirect into a sandbox.googleapis.com service.
+              redirect: "manual"
             });
             clearTimeout(timeoutId);
 

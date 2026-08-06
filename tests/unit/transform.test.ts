@@ -176,6 +176,41 @@ describe("Unit Tests: transformToGoogleBody", () => {
     expect(funcRespPart).toBeDefined();
     expect(funcRespPart.functionResponse.id).toBe("call_abc123");
   });
+
+  test("Tool responses neutralize ordinary JSON Schema refs", () => {
+    const openaiBody = {
+      model: "gemini-3.6-flash-high",
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_validation",
+            type: "function",
+            function: { name: "validate_request", arguments: "{}" }
+          }]
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_validation",
+          content: JSON.stringify({
+            error: {
+              schema: { "$ref": "#/components/schemas/ValidationError" },
+              nested: [{ "$ref": "#/$defs/FieldError" }]
+            }
+          })
+        }
+      ]
+    };
+
+    const result = transformToGoogleBody(openaiBody, "p", true, "us-central1");
+    const funcResp = result.request.contents[1].parts[0].functionResponse;
+
+    expect(funcResp.name).toBe("validate_request");
+    expect(funcResp.response.error.schema.schemaRef).toBe("#/components/schemas/ValidationError");
+    expect(funcResp.response.error.nested[0].schemaRef).toBe("#/$defs/FieldError");
+    expect(JSON.stringify(funcResp.response)).not.toContain('"$ref"');
+  });
 });
 
 describe("Unit Tests: transformGoogleEventToOpenAI", () => {
