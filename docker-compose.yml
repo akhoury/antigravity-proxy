@@ -1,6 +1,7 @@
 services:
   antigravity-proxy:
-    image: oven/bun:1
+    build: .
+    image: antigravity-proxy:korvo-video
     container_name: antigravity-proxy
     restart: unless-stopped
     working_dir: /app
@@ -12,9 +13,14 @@ services:
       # 保留原廠的關鍵環境變數
       - ACCOUNTS_FILE=/app/data/antigravity-accounts.json
       - BASE_URL=http://127.0.0.1:3000
+      - KORVO_CONTROL_PORT=${KORVO_CONTROL_PORT:-3100}
+      - KORVO_MEDIA_BASE_URL=${KORVO_MEDIA_BASE_URL:-http://192.168.50.75:3001}
+      - KORVO_ALLOWED_DEVICE_ID=${KORVO_ALLOWED_DEVICE_ID:-esp32s31-korvo-1}
+      - KORVO_MEDIA_API_TOKEN=${KORVO_MEDIA_API_TOKEN:-}
     ports:
       # 避開 3000 port 衝突
       - "3001:3000"
+      - "3101:${KORVO_CONTROL_PORT:-3100}"
     volumes:
       # 1. 掛載本地 Source Code，修改後直接生效
       - .:/app
@@ -24,10 +30,9 @@ services:
       - /app/node_modules
       # 4. Bun 套件快取
       - bun-cache:/root/.bun
-    # 啟動時自動安裝/更新依賴並執行
-    command: sh -c "bun install && bun run start"
+    # Runtime dependencies are installed into the image at build time. Running
+    # bun install again against this anonymous volume can race on its links.
+    command: bun run start
 
 volumes:
   bun-cache:
-
-

@@ -15,6 +15,7 @@ import { refreshAllQuotas, fetchQuota, supportedModelsCache } from "./api/quota"
 import { parseGoogleError } from "./utils/errors";
 import { shouldRetryWithAggressiveSchema } from "./utils/schema";
 import { assertNonSandboxEndpoint, getNonSandboxEndpoints } from "./utils/endpoints";
+import { KorvoVideoService } from "./media/korvo-video";
 
 const logBuffer: string[] = [];
 const MAX_LOGS = 200;
@@ -60,6 +61,16 @@ setInterval(refreshAllQuotas, proxyConfig.quota.refreshIntervalMs);
 // Initial quota refresh on startup
 refreshAllQuotas();
 
+const korvoVideo = new KorvoVideoService();
+const configuredKorvoControlPort = Number.parseInt(process.env.KORVO_CONTROL_PORT || "3100", 10);
+if (Number.isInteger(configuredKorvoControlPort) && configuredKorvoControlPort > 0 && configuredKorvoControlPort < 65536) {
+  try {
+    korvoVideo.startControlServer(configuredKorvoControlPort);
+  } catch (error) {
+    console.error("Korvo video control listener failed to start", error);
+  }
+}
+
 Bun.serve({
   port: 3000,
   hostname: "0.0.0.0",
@@ -79,6 +90,8 @@ Bun.serve({
             }
         });
     }
+    const korvoVideoResponse = await korvoVideo.handleHttp(req, url);
+    if (korvoVideoResponse) return korvoVideoResponse;
     if (cleanPath === "/oauth/start") {
       return Response.redirect(generateAuthUrl());
     }
