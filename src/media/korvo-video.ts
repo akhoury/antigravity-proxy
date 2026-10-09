@@ -7,12 +7,12 @@ type VideoDetail = "native" | "smooth";
 const DEFAULT_VIDEO_DETAIL: VideoDetail = "native";
 
 export function videoFilter(fps: number, detail: VideoDetail): string {
-  const preScale = detail === "smooth" ? ",scale=400:208:force_original_aspect_ratio=decrease" : "";
-  return `fps=fps=${fps}:start_time=0${preScale},scale=800:416:force_original_aspect_ratio=decrease,pad=800:416:(ow-iw)/2:(oh-ih)/2:black`;
+  const preScale = detail === "smooth" ? ",scale=400:240:force_original_aspect_ratio=decrease" : "";
+  return `fps=fps=${fps}:start_time=0${preScale},scale=800:480:force_original_aspect_ratio=decrease,pad=800:480:(ow-iw)/2:(oh-ih)/2:black`;
 }
 // Project before serialization: full yt-dlp metadata includes descriptions,
 // every available format and potentially thousands of manifest fragments.
-export const YOUTUBE_METADATA_TEMPLATE = '{"title":%(title)j,"url":%(url)j,"requested_formats":%(requested_formats.:.{url,vcodec,acodec})j}';
+export const YOUTUBE_METADATA_TEMPLATE = '{"title":%(title)j,"duration":%(duration)j,"url":%(url)j,"http_headers":%(http_headers)j,"requested_formats":%(requested_formats.:.{url,vcodec,acodec,http_headers})j}';
 
 type DeviceSocket = {
   write(data: string): unknown;
@@ -27,8 +27,16 @@ type VideoSession = {
   id: string;
   deviceId: string;
   title: string;
+  query: string;
+  durationSeconds?: number;
+  recoveryAttempt: number;
+  lastProgressAt?: number;
+  lastProgressPlaying?: boolean;
+  audioProcessExitCode?: number;
   videoSourceUrl: string;
   audioSourceUrl: string;
+  videoUserAgent?: string;
+  audioUserAgent?: string;
   clock: VideoClock<VideoFrame>;
   jpegQuality: number;
   detail: VideoDetail;
@@ -49,18 +57,24 @@ type YoutubeFormat = {
   url?: string;
   vcodec?: string;
   acodec?: string;
+  http_headers?: Record<string, string>;
 };
 
 type YoutubeMetadata = {
   title?: string;
+  duration?: number;
   url?: string;
+  http_headers?: Record<string, string>;
   requested_formats?: YoutubeFormat[];
 };
 
 type MediaSources = {
   title?: string;
+  durationSeconds?: number;
   videoUrl: string;
   audioUrl: string;
+  videoUserAgent?: string;
+  audioUserAgent?: string;
 };
 
 const textDecoder = new TextDecoder();
@@ -94,6 +108,11 @@ function isHttpSource(value: unknown): value is string {
   }
 }
 
+function userAgentFrom(headers: Record<string, string> | undefined): string | undefined {
+  const value = headers?.["User-Agent"];
+  return typeof value === "string" && /^[\x20-\x7e]{1,256}$/.test(value) ? value : undefined;
+}
+
 export function parseYoutubeSources(stdout: string): MediaSources {
   let metadata: YoutubeMetadata;
   try {
@@ -104,14 +123,56 @@ export function parseYoutubeSources(stdout: string): MediaSources {
   }
   // A missing output-template field is emitted as "NA", including on muxed results.
   const formats = Array.isArray(metadata.requested_formats) ? metadata.requested_formats : [];
-  const videoUrl = formats.find((format) =>
-    format?.vcodec && format.vcodec !== "none" && isHttpSource(format.url))?.url;
-  const audioUrl = formats.find((format) =>
-    format?.acodec && format.acodec !== "none" && isHttpSource(format.url))?.url;
+  const videoFormat = formats.find((format) =>
+    format?.vcodec && format.vcodec !== "none" && isHttpSource(format.url));
+  const audioFormat = formats.find((format) =>
+    format?.acodec && format.acodec !== "none" && isHttpSource(format.url));
   const title = typeof metadata.title === "string" ? metadata.title : undefined;
-  if (videoUrl && audioUrl) return { title, videoUrl, audioUrl };
-  if (isHttpSource(metadata.url)) return { title, videoUrl: metadata.url, audioUrl: metadata.url };
+  const durationSeconds = typeof metadata.duration === "number" &&
+    Number.isFinite(metadata.duration) && metadata.duration > 0 && metadata.duration <= 86400
+    ? metadata.duration : undefined;
+  const duration = durationSeconds !== undefined ? { durationSeconds } : {};
+  if (videoFormat && audioFormat) {
+    const videoUserAgent = userAgentFrom(videoFormat.http_headers);
+    const audioUserAgent = userAgentFrom(audioFormat.http_headers);
+    return { title, ...duration, videoUrl: videoFormat.url!, audioUrl: audioFormat.url!,
+      ...(videoUserAgent ? { videoUserAgent } : {}), ...(audioUserAgent ? { audioUserAgent } : {}) };
+  }
+  if (isHttpSource(metadata.url)) {
+    const userAgent = userAgentFrom(metadata.http_headers);
+    return { title, ...duration, videoUrl: metadata.url, audioUrl: metadata.url,
+      ...(userAgent ? { videoUserAgent: userAgent, audioUserAgent: userAgent } : {}) };
+  }
   throw new Error("YouTube search returned no playable audio/video sources");
+}
+
+// A long lived YouTube HTTP connection can close before the media ends. Resume
+// from the current byte offset; if recovery still fails, keep the Ogg stream
+// valid and the device clock moving through the video's known duration.
+export function audioTranscodeArgs(ffmpegPath: string, url: string, userAgent?: string,
+    durationSeconds?: number): string[] {
+  return [
+    ffmpegPath, "-nostdin", "-re", "-v", "error",
+    "-reconnect", "1",
+    ...(durationSeconds !== undefined ? ["-reconnect_at_eof", "1"] : []),
+    "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+    "-reconnect_on_http_error", "5xx", "-reconnect_delay_max", "2",
+    ...(userAgent ? ["-user_agent", userAgent] : []),
+    "-i", url,
+    "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "80k",
+    ...(durationSeconds !== undefined ? ["-af", "apad", "-t", String(durationSeconds)] : []),
+    "-f", "ogg", "pipe:1",
+  ];
+}
+
+export function parseYoutubeSourceCandidates(stdout: string): MediaSources[] {
+  const candidates: MediaSources[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try { candidates.push(parseYoutubeSources(line)); } catch {}
+  }
+  if (!candidates.length) throw new Error("YouTube search returned no playable results");
+  return candidates;
 }
 
 function concatBytes(first: Uint8Array, second: Uint8Array): Uint8Array<ArrayBuffer> {
@@ -321,6 +382,13 @@ export class KorvoVideoService {
       }
       return;
     }
+    if (frame.type === "asset.error") {
+      // Device reports a bounded, local decoder/HTTP reason. Keep it in server
+      // logs so intermittent JPEG failures can be diagnosed after the fact.
+      const reason = typeof payload.value === "string" ? payload.value.slice(0, 120) : "unknown";
+      console.warn("KORVO_ASSET_ERROR", JSON.stringify({reason}));
+      return;
+    }
     if (frame.type === "protocol.error") {
       const allowedCodes = new Set([
         "invalid_json",
@@ -366,9 +434,10 @@ export class KorvoVideoService {
         typeof payload.playing === "boolean") {
       const deviceId = this.deviceIdFor(connection);
       const session = this.sessions.get(payload.session_id);
-      if (!session || session.deviceId !== deviceId || session.stopped ||
-          !session.clock.advance(payload.position_ms)) return;
-      this.flushDueFrame(session);
+      if (!session || session.deviceId !== deviceId || session.stopped) return;
+      session.lastProgressAt = Date.now();
+      session.lastProgressPlaying = payload.playing;
+      if (session.clock.advance(payload.position_ms)) this.flushDueFrame(session);
       if (!payload.playing && !session.stopped && this.sessions.get(session.id) === session) this.stopSession(session, "audio_ended");
     }
     if (frame.type === "video.presented" && typeof payload.action === "string" &&
@@ -398,7 +467,8 @@ export class KorvoVideoService {
   }
 
   private async startForDevice(deviceId: string, query: string, frameRate = this.frameRate,
-      jpegQuality = DEFAULT_JPEG_QUALITY, detail = DEFAULT_VIDEO_DETAIL, existingGen?: number): Promise<VideoSession> {
+      jpegQuality = DEFAULT_JPEG_QUALITY, detail = DEFAULT_VIDEO_DETAIL, existingGen?: number,
+      recoveryAttempt = 0): Promise<VideoSession> {
     if (!this.mediaBaseUrl) throw new Error("KORVO_MEDIA_BASE_URL is not configured");
     const connection = this.devices.get(deviceId);
     if (!connection) throw new Error("Korvo device is not connected");
@@ -431,8 +501,13 @@ export class KorvoVideoService {
       id: compactId(),
       deviceId,
       title: media.title || query.trim(),
+      query: query.trim(),
+      durationSeconds: media.durationSeconds,
+      recoveryAttempt,
       videoSourceUrl: media.videoUrl,
       audioSourceUrl: media.audioUrl,
+      videoUserAgent: media.videoUserAgent,
+      audioUserAgent: media.audioUserAgent,
       clock: new VideoClock(frameRate),
       jpegQuality,
       detail,
@@ -443,8 +518,21 @@ export class KorvoVideoService {
     this.sessions.set(session.id, session);
     session.clockTimer = setInterval(() => {
       if (session.stopped) return;
-      if (Date.now() - session.clock.lastAdvanceAt > 30_000) {
-        if (this.sessions.get(session.id) === session) {
+      const stalledForMs = Date.now() - session.clock.lastAdvanceAt;
+      const timeoutMs = session.recoveryAttempt === 0 ? 15_000 : 30_000;
+      if (stalledForMs > timeoutMs) {
+        if (this.sessions.get(session.id) !== session) return;
+        console.warn("KORVO_AUDIO_STALL", JSON.stringify({
+          attempt: session.recoveryAttempt, stalledForMs,
+          audioMs: session.clock.positionMs,
+          lastProgressAgeMs: session.lastProgressAt ? Date.now() - session.lastProgressAt : null,
+          lastProgressPlaying: session.lastProgressPlaying ?? null,
+          audioProcessExitCode: session.audioProcessExitCode ?? null,
+        }));
+        if (session.recoveryAttempt === 0) {
+          void this.startForDevice(session.deviceId, session.query, session.clock.fps,
+            session.jpegQuality, session.detail, undefined, 1).catch(() => {});
+        } else {
           this.send(session.deviceId, "toast.show", {title: "Video stopped", body: "Audio clock timed out"});
           this.stopSession(session, "audio_clock_timeout");
         }
@@ -461,42 +549,65 @@ export class KorvoVideoService {
   }
 
   private async searchYoutube(query: string): Promise<MediaSources> {
-    // A resolved URL is not proof that GVS will accept it. Validate both tracks
-    // before publishing video.start; never leave the device on a silent stream.
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // Search multiple results: the first match can be removed, blocked, or have
+    // signed streams that ffmpeg cannot open. Keep the full search below the
+    // control API's 75-second timeout and validate before video.start.
+    const deadline = Date.now() + 68_000;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) {
+        // YouTube intermittently rejects every fresh signed stream for a few
+        // seconds. A delayed default-client retry succeeds where immediately
+        // switching to android_vr returns the same 403 or no adaptive formats.
+        const backoffMs = attempt * 1500;
+        if (Date.now() + backoffMs + 35_000 > deadline) break;
+        await Bun.sleep(backoffMs);
+      }
+      let candidates: MediaSources[];
       try {
-        const media = await this.resolveYoutube(query, attempt === 1);
-        const probes = await Promise.allSettled([
-          this.probeMediaSource(media.videoUrl), this.probeMediaSource(media.audioUrl),
-        ]);
-        const status = probes.map(p => p.status === "fulfilled" ? p.value : 0);
-        if (status.every(code => code === 200 || code === 206)) {
-          const [videoValid, audioValid] = await Promise.all([
-            this.probeTranscoderSource(media.videoUrl, "video"),
-            this.probeTranscoderSource(media.audioUrl, "audio"),
-          ]);
-          if (videoValid && audioValid) return media;
-          console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, videoValid, audioValid}));
-        } else {
-          console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, status}));
-        }
+        candidates = await this.resolveYoutube(query, false);
       } catch {
         console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, resolutionFailed: true}));
+        continue;
+      }
+      for (let index = 0; index < candidates.length; index++) {
+        if (Date.now() + 12_000 > deadline) break;
+        const media = candidates[index];
+        try {
+          const probes = await Promise.allSettled([
+            this.probeMediaSource(media.videoUrl, media.videoUserAgent),
+            this.probeMediaSource(media.audioUrl, media.audioUserAgent),
+          ]);
+          const status = probes.map(p => p.status === "fulfilled" ? p.value : 0);
+          if (status.every(code => code === 200 || code === 206)) {
+            const [videoValid, audioValid] = await Promise.all([
+              this.probeTranscoderSource(media.videoUrl, "video", media.videoUserAgent),
+              this.probeTranscoderSource(media.audioUrl, "audio", media.audioUserAgent),
+            ]);
+            if (videoValid && audioValid) return media;
+            console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, candidate: index + 1, videoValid, audioValid}));
+          } else {
+            console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, candidate: index + 1, status}));
+          }
+        } catch {
+          console.warn("KORVO_MEDIA_SOURCE_RETRY", JSON.stringify({attempt: attempt + 1, candidate: index + 1, probeFailed: true}));
+        }
       }
     }
-    throw new Error("YouTube stream unavailable after two attempts");
+    throw new Error("YouTube stream unavailable after candidate validation");
   }
 
-  private async probeTranscoderSource(url: string, kind: "video" | "audio"): Promise<boolean> {
+  private async probeTranscoderSource(url: string, kind: "video" | "audio", userAgent?: string): Promise<boolean> {
     const args = kind === "video"
       ? [
           this.ffmpegPath,
-          "-nostdin", "-v", "error", "-rw_timeout", "5000000", "-i", url,
+          "-nostdin", "-v", "error", "-rw_timeout", "5000000",
+          ...(userAgent ? ["-user_agent", userAgent] : []), "-i", url,
           "-an", "-frames:v", "1", "-vf", "scale=32:32", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1",
         ]
       : [
           this.ffmpegPath,
-          "-nostdin", "-v", "error", "-rw_timeout", "5000000", "-i", url,
+          "-nostdin", "-v", "error", "-rw_timeout", "5000000",
+          ...(userAgent ? ["-user_agent", userAgent] : []), "-i", url,
           "-vn", "-t", "0.15", "-ac", "1", "-ar", "24000", "-f", "s16le", "pipe:1",
         ];
 
@@ -556,12 +667,17 @@ export class KorvoVideoService {
         proc.exited.catch(() => -1),
       ]);
 
-      if (timedOut || exitCode !== 0 || stdoutRes.error || stderrRes.error) return false;
-      if (kind === "video") {
-        return stdoutRes.length === 3072;
-      } else {
-        return stdoutRes.length > 0 && stdoutRes.length <= 32768 && stdoutRes.length % 2 === 0;
+      if (timedOut || exitCode !== 0 || stdoutRes.error || stderrRes.error) {
+        console.warn("KORVO_MEDIA_PROBE_RESULT", JSON.stringify({kind, timedOut, exitCode,
+          stdoutLength: stdoutRes.length, stderrLength: stderrRes.length,
+          stdoutError: stdoutRes.error, stderrError: stderrRes.error}));
+        return false;
       }
+      const valid = kind === "video" ? stdoutRes.length === 3072
+        : stdoutRes.length > 0 && stdoutRes.length <= 32768 && stdoutRes.length % 2 === 0;
+      if (!valid) console.warn("KORVO_MEDIA_PROBE_RESULT", JSON.stringify({kind, exitCode,
+        stdoutLength: stdoutRes.length, stderrLength: stderrRes.length, invalidLength: true}));
+      return valid;
     } catch {
       return false;
     } finally {
@@ -574,13 +690,14 @@ export class KorvoVideoService {
     }
   }
 
-  private async probeMediaSource(url: string): Promise<number> {
-    const response = await fetch(url, {headers: {Range: "bytes=0-1023"}, signal: AbortSignal.timeout(5000)});
+  private async probeMediaSource(url: string, userAgent?: string): Promise<number> {
+    const headers = {Range: "bytes=0-1023", ...(userAgent ? {"User-Agent": userAgent} : {})};
+    const response = await fetch(url, {headers, signal: AbortSignal.timeout(5000)});
     try { return response.status; }
     finally { await response.body?.cancel(); } // No media buffering/download.
   }
 
-  private async resolveYoutube(query: string, alternateClient: boolean): Promise<MediaSources> {
+  private async resolveYoutube(query: string, alternateClient: boolean): Promise<MediaSources[]> {
     const process = Bun.spawn([
       this.ytDlpPath,
       "--no-playlist",
@@ -593,10 +710,10 @@ export class KorvoVideoService {
       // of rejecting a result merely because no muxed 480p stream exists.
       "--format", "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best",
       ...(alternateClient ? ["--extractor-args", "youtube:player_client=android_vr"] : []),
-      `ytsearch1:${query}`,
+      `ytsearch3:${query}`,
     ], { stdout: "pipe", stderr: "pipe" });
-    // Two 25-second resolutions + two concurrent 5-second probe rounds remain
-    // bounded below the control API's 75-second client timeout.
+    // Each resolution is capped at 25 seconds; searchYoutube enforces the
+    // overall 68-second deadline below the control API's 75-second timeout.
     const timer = setTimeout(() => process.kill("SIGKILL"), 25_000);
     try {
       const [stdout, _stderr, exitCode] = await Promise.all([
@@ -606,7 +723,7 @@ export class KorvoVideoService {
       ]);
       if (exitCode !== 0) throw new Error("YouTube resolution failed");
       console.info(`[KorvoVideo] selected metadata bytes=${new TextEncoder().encode(stdout).length}`);
-      return parseYoutubeSources(stdout);
+      return parseYoutubeSourceCandidates(stdout);
     } catch (error) {
       process.kill("SIGKILL");
       await process.exited;
@@ -619,7 +736,9 @@ export class KorvoVideoService {
   private startFramePump(session: VideoSession): void {
     const process = Bun.spawn([
       this.ffmpegPath,
-      "-nostdin", "-v", "error", "-i", session.videoSourceUrl,
+      "-nostdin", "-v", "error",
+      ...(session.videoUserAgent ? ["-user_agent", session.videoUserAgent] : []),
+      "-i", session.videoSourceUrl,
       "-an", "-vf", videoFilter(session.clock.fps, session.detail),
       "-q:v", String(session.jpegQuality), "-pix_fmt", "yuvj420p", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
     ], { stdout: "pipe", stderr: "pipe" });
@@ -687,11 +806,8 @@ export class KorvoVideoService {
 
   private streamAudio(session: VideoSession): Response {
     session.audioProcess?.kill();
-    const process = Bun.spawn([
-      this.ffmpegPath,
-      "-nostdin", "-re", "-v", "error", "-i", session.audioSourceUrl,
-      "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "80k", "-f", "ogg", "pipe:1",
-    ], { stdout: "pipe", stderr: "pipe" });
+    const process = Bun.spawn(audioTranscodeArgs(this.ffmpegPath, session.audioSourceUrl,
+      session.audioUserAgent, session.durationSeconds), { stdout: "pipe", stderr: "pipe" });
     session.audioProcess = process;
     this.trackTranscoder(session, process, "audio");
     return new Response(process.stdout, {
@@ -713,7 +829,14 @@ export class KorvoVideoService {
           tail = (tail + textDecoder.decode(chunk)).slice(-4096);
         }
         const code = await process.exited;
-        if (code && !session.stopped) {
+        if (session.stopped || (kind === "audio" && session.audioProcess !== process) ||
+            (kind === "video" && session.frameProcess !== process)) return;
+        if (kind === "audio") {
+          session.audioProcessExitCode = code;
+          console.log("KORVO_AUDIO_PROCESS_EXIT", JSON.stringify({code, audioMs: session.clock.positionMs,
+            expectedMs: session.durationSeconds ? Math.round(session.durationSeconds * 1000) : null}));
+        }
+        if (code) {
           // Never log signed source URLs. Preserve only bounded error classes.
           const http = tail.match(/(?:HTTP error|Server returned)\s+\d{3}/g) || [];
           console.warn("KORVO_TRANSCODE_ERROR", JSON.stringify({kind, code, http,
