@@ -1,7 +1,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-const API_URL = "http://localhost:3000/v1/chat/completions";
+const API_URL = "http://localhost:3333/v1/chat/completions";
 const MODEL = "gemini-2.0-flash";
 
 const generateLongMessage = (words: number) => {

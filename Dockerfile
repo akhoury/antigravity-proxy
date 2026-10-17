@@ -20,7 +20,10 @@ COPY package.json ./
 # Keep the image-owned files writable for the unprivileged runtime user.
 RUN mkdir -p /app/data && chown -R bun:bun /app
 
-EXPOSE 3000 3100
+# Inside a container the server must listen on all interfaces so published
+# ports reach it; outside Docker it defaults to 127.0.0.1.
+ENV HOST=0.0.0.0
+EXPOSE 3333 3100
 
 # The compose deployment bind-mounts existing account data owned by the host.
 # Retain the base image's runtime user so upgrades do not break persistence.

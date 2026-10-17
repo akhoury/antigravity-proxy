@@ -1,6 +1,7 @@
 import { getSignature, cacheSignature } from "./cache";
 import { cleanJSONSchemaForAntigravity } from "./schema";
 import { getProxyConfig } from "../config/manager";
+import { supportedModelsCache } from "../api/quota";
 
 const TOOL_NAME_REMAP_CACHE = new Map<string, string>();
 
@@ -119,8 +120,12 @@ export function transformToGoogleBody(
       baseModel = baseModel.replace(previewMatch[0], "");
   }
 
+  // Claude IDs the backend advertises with a tier suffix (e.g. claude-sonnet-5-5-low)
+  // are real model IDs, so the tier must be kept.
+  const isAdvertisedModel = supportedModelsCache.has(resolvedModel);
+
   // Force Claude model IDs to strip tier for the backend
-        if (googleModel.includes("claude")) {
+        if (googleModel.includes("claude") && !isAdvertisedModel) {
             googleModel = baseModel;
             if (googleModel === "claude-opus-4-6") googleModel = "claude-opus-4-6-thinking";
             if (googleModel === "claude-sonnet-4-6") googleModel = "claude-sonnet-4-6-thinking";
@@ -170,7 +175,7 @@ export function transformToGoogleBody(
           } else {
                googleModel = baseModel;
           }
-       } else {
+       } else if (!isAdvertisedModel) {
            googleModel = baseModel;
            if (googleModel === "claude-sonnet-4-6") googleModel = "claude-sonnet-4-6-thinking";
            if (googleModel === "claude-sonnet-4-5") googleModel = "claude-sonnet-4-5-thinking";

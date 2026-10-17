@@ -6,7 +6,7 @@ await loadProxyConfig();
 const pkg = await Bun.file("package.json").json();
 const APP_VERSION = pkg.version || "0.0.0";
 
-import { initManager, getBestAccount, updateAccountUsage, addAccount, getAccounts, removeAccount, getStrategy, setStrategy, saveAccounts, emitAccountFlash, eventBus, getEarliestReset, markCooldown, ensureFingerprint, regenerateFingerprint, getCooldowns, resetAccount, flagAccountChallenge, flagModelUnsupported, updateAccountProject, getFamilyName, resetAllCooldowns } from "./auth/manager";
+import { initManager, getBestAccount, updateAccountUsage, addAccount, getAccounts, toPublicAccounts, removeAccount, getStrategy, setStrategy, saveAccounts, emitAccountFlash, eventBus, getEarliestReset, markCooldown, ensureFingerprint, regenerateFingerprint, getCooldowns, resetAccount, flagAccountChallenge, flagModelUnsupported, updateAccountProject, getFamilyName, resetAllCooldowns } from "./auth/manager";
 import { type SelectionStrategy, type AntigravityAccount } from "./auth/types";
 import { generateAuthUrl, exchangeCode, getUserEmail, getProjectId } from "./auth/oauth";
 import { transformToGoogleBody, transformGoogleEventToOpenAI, createOpenAIStreamTransformer, getOriginalToolName } from "./utils/transform";
@@ -16,6 +16,7 @@ import { parseGoogleError } from "./utils/errors";
 import { shouldRetryWithAggressiveSchema } from "./utils/schema";
 import { assertNonSandboxEndpoint, getNonSandboxEndpoints } from "./utils/endpoints";
 import { KorvoVideoService } from "./media/korvo-video";
+import { SERVER_HOST, SERVER_PORT } from "./config/server";
 
 const logBuffer: string[] = [];
 const MAX_LOGS = 200;
@@ -65,15 +66,15 @@ const korvoVideo = new KorvoVideoService();
 const configuredKorvoControlPort = Number.parseInt(process.env.KORVO_CONTROL_PORT || "3100", 10);
 if (Number.isInteger(configuredKorvoControlPort) && configuredKorvoControlPort > 0 && configuredKorvoControlPort < 65536) {
   try {
-    korvoVideo.startControlServer(configuredKorvoControlPort);
+    korvoVideo.startControlServer(configuredKorvoControlPort, SERVER_HOST);
   } catch (error) {
     console.error("Korvo video control listener failed to start", error);
   }
 }
 
 Bun.serve({
-  port: 3000,
-  hostname: "0.0.0.0",
+  port: SERVER_PORT,
+  hostname: SERVER_HOST,
   idleTimeout: 0,
   async fetch(req) {
     const url = new URL(req.url);
@@ -550,14 +551,18 @@ Bun.serve({
 
                 send("init", {
                     version: APP_VERSION,
-                    accounts: getAccounts(),
+                    accounts: toPublicAccounts(getAccounts()),
                     strategy: getStrategy(),
                     supportedModels: Array.from(supportedModelsCache).sort(),
                     cooldowns: getCooldowns(),
                     logs: logBuffer
                 });
 
-                onUpdate = (data: any) => send("update", { ...data, supportedModels: Array.from(supportedModelsCache).sort() });
+                onUpdate = (data: any) => send("update", {
+                    ...data,
+                    ...(Array.isArray(data.accounts) && { accounts: toPublicAccounts(data.accounts) }),
+                    supportedModels: Array.from(supportedModelsCache).sort()
+                });
                 onFlash = (data: { email: string, status: 'success' | 'error' }) => send("flash", data);
                 onLog = (msg: string) => send("log", { message: msg });
                 onCooldown = (data: any) => send("cooldown", data);
@@ -588,7 +593,7 @@ Bun.serve({
     if (url.pathname === "/api/status") {
         return new Response(JSON.stringify({
             version: APP_VERSION,
-            accounts: getAccounts(),
+            accounts: toPublicAccounts(getAccounts()),
             strategy: getStrategy(),
             supportedModels: Array.from(supportedModelsCache).sort()
         }), { headers: { "Content-Type": "application/json" } });
@@ -739,7 +744,7 @@ Bun.serve({
 
           await addAccount(newAccount);
           
-          return Response.redirect(`http://localhost:3000/frontend/index.html`);
+          return Response.redirect("/frontend/index.html");
       } catch (e) {
           return new Response(`Auth error: ${e}`, { status: 500 });
       }
@@ -763,4 +768,4 @@ Bun.serve({
   }
 });
 
-console.log("Antigravity Proxy running on http://127.0.0.1:3000");
+console.log(`Antigravity Proxy running on http://${SERVER_HOST}:${SERVER_PORT}`);

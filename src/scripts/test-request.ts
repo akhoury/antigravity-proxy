@@ -4,7 +4,7 @@ async function performRequest(label: string, body: any) {
   console.log("🚀 Sending request...");
   
   try {
-    const response = await fetch("http://127.0.0.1:3000/v1/chat/completions", {
+    const response = await fetch("http://127.0.0.1:3333/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

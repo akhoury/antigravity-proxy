@@ -7,7 +7,7 @@ async function testClaude() {
   
   while (true) {
       try {
-        const response = await fetch("http://127.0.0.1:3000/v1/chat/completions", {
+        const response = await fetch("http://127.0.0.1:3333/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

@@ -49,6 +49,11 @@ export async function initManager() {
 }
 
 export function getAccounts() { return accounts; }
+
+// OAuth tokens never leave the server; the dashboard only needs account metadata.
+export function toPublicAccounts(list: AntigravityAccount[]) {
+  return list.map(({ accessToken, refreshToken, ...account }) => account);
+}
 export function getStrategy() { return currentStrategy; }
 export function setStrategy(strategy: SelectionStrategy) {
   currentStrategy = strategy;

@@ -244,9 +244,9 @@ export class KorvoVideoService {
       : DEFAULT_FRAME_RATE;
   }
 
-  startControlServer(port: number): void {
+  startControlServer(port: number, hostname: string): void {
     Bun.listen({
-      hostname: "0.0.0.0",
+      hostname,
       port,
       socket: {
         open: (socket: any) => {
@@ -272,7 +272,7 @@ export class KorvoVideoService {
         error: (socket: any) => this.removeConnection(socket.data as DeviceConnection | undefined),
       },
     });
-    console.log(`Korvo video control listening on tcp://0.0.0.0:${port}`);
+    console.log(`Korvo video control listening on tcp://${hostname}:${port}`);
   }
 
   async handleHttp(request: Request, url: URL): Promise<Response | null> {

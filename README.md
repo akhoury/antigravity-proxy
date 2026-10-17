@@ -2,14 +2,14 @@
 
 ![Antigravity Proxy Dashboard](screenshots/screenshot.png)
 
-Antigravity Proxy is a high-performance gateway that exposes Google's internal Gemini and Claude APIs through an **OpenAI-compatible interface**. It enables seamless integration between advanced models (like Claude 4.6 Opus, Gemini 3, and GPT-equivalent models) and CLI agents (such as **OpenCode** or **Claude Code**), as well as any application supporting the OpenAI API standard.
+Antigravity Proxy is a high-performance gateway that exposes Google's internal Gemini and Claude APIs through an **OpenAI-compatible interface**. It enables seamless integration between advanced models (like Claude Opus 5.5, Gemini 3, and GPT-OSS) and agents that speak the OpenAI API (such as **OpenCode**), as well as any application supporting the OpenAI API standard.
 
 This project is strongly inspired by [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth).
 
 ## Features
 
 - **OpenAI API Compatibility**: Full support for `v1/chat/completions` with streaming (SSE).
-- **Multi-Agent Support**: Specifically designed to work with **Claude Code**, **OpenCode**, and other agentic frameworks.
+- **Multi-Agent Support**: Works with **OpenCode** and other agentic frameworks that accept an OpenAI-compatible provider.
 - **Account Rotation & Health Scoring**: Automatically rotates multiple Google accounts, penalizing those with errors and favoring healthy ones.
 - **Quota Management**: Real-time monitoring and automatic cooldowns (backoff) on `429 Too Many Requests` errors.
 - **Dual-Pool Routing**:
@@ -37,20 +37,37 @@ Requirements: Bun (v1.0.0 or higher).
 bun install
 bun run start
 ```
-The server starts on port 3000.
+The server listens on `http://127.0.0.1:3333` (this machine only). Set `PORT` to change the port, or `HOST=0.0.0.0` to accept connections from other machines.
+
+On Windows, `bun run start` can fail with `interpreter executable "/bin/sh" not found`; run `bun src/server.ts` instead.
+
+Open `http://127.0.0.1:3333/` for the dashboard, and `http://127.0.0.1:3333/oauth/start` to add a Google account.
+
+## OpenAI-Compatible API
+
+Base URL: `http://127.0.0.1:3333/v1`. No API key is checked, so clients that require one can use any placeholder.
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/models` | Models available to your accounts |
+| `POST /v1/chat/completions` | Chat completions, streaming (`stream: true`) or not, with `tools`, `temperature`, `max_tokens`, `top_p`, `stop`, and `thinking_budget` / `thinking.budget_tokens` |
+
+```bash
+curl http://127.0.0.1:3333/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-5-5-low", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+### Choosing a model
+
+- Use the IDs returned by `GET /v1/models`; they depend on your account.
+- Plain `gemini-2.5-*` and Gemini 3 Pro IDs are routed to the Gemini CLI endpoint, which needs a Gemini Code Assist license. Prefix them with `antigravity-` (e.g. `antigravity-gemini-2.5-flash`) to use the Antigravity endpoint instead.
+- Google keeps advertising some models it is retiring (tagged "Leaving Soon"), such as Gemini 3.1 Pro and Gemini 3.6 Flash; these can return `404 model_not_found`. `gemini-3.8-flash-tiered` works but is not listed by `/v1/models`.
 
 ## Integration Guides
 
-### Claude Code Configuration
-To use **Claude Code** with Antigravity Proxy, point the API base URL to your local instance and specify a model from the Sandbox Pool:
-
-```bash
-# Point Claude Code to the proxy
-export CLAUDE_CODE_API_BASE="http://localhost:3000/v1"
-
-# Run Claude specifying an Antigravity model
-claude --model antigravity-claude-sonnet-4-5
-```
+### Claude Code
+Claude Code talks to the Anthropic Messages API, not the OpenAI API, so it cannot use this proxy directly. Put a translation layer that exposes an Anthropic-compatible endpoint (for example LiteLLM or claude-code-router) in front of the proxy, or use an OpenAI-compatible agent such as OpenCode.
 
 ### OpenCode Configuration
 Add the following provider to your `~/.config/opencode/opencode.json` under the `"provider"` key:
@@ -61,80 +78,52 @@ Add the following provider to your `~/.config/opencode/opencode.json` under the 
         "npm": "@ai-sdk/openai-compatible",
         "name": "Antigravity Proxy",
         "options": {
-            "baseURL": "http://localhost:3000/v1"
+            "baseURL": "http://localhost:3333/v1"
         },
         "models": {
-            "antigravity-gemini-3.1-pro-low": {
-                "name": "Gemini 3.1 Pro Low (Antigravity)",
-                "limit": { "context": 1048576, "output": 65535 }
+            "claude-opus-5-5-high": {
+                "name": "Claude Opus 5.5 High (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
             },
-            "antigravity-gemini-3.1-pro-high": {
-                "name": "Gemini 3.1 Pro High (Antigravity)",
-                "limit": { "context": 1048576, "output": 65535 }
+            "claude-opus-5-5-medium": {
+                "name": "Claude Opus 5.5 Medium (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
             },
-            "antigravity-gemini-3-pro-low": {
-                "name": "Gemini 3 Pro Low (Antigravity)",
-                "limit": { "context": 1048576, "output": 65535 }
+            "claude-opus-5-5-low": {
+                "name": "Claude Opus 5.5 Low (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
             },
-            "antigravity-gemini-3-pro-high": {
-                "name": "Gemini 3 Pro High (Antigravity)",
-                "limit": { "context": 1048576, "output": 65535 }
+            "claude-sonnet-5-5-high": {
+                "name": "Claude Sonnet 5.5 High (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
             },
-            "antigravity-gemini-3-flash": {
+            "claude-sonnet-5-5-medium": {
+                "name": "Claude Sonnet 5.5 Medium (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
+            },
+            "claude-sonnet-5-5-low": {
+                "name": "Claude Sonnet 5.5 Low (Antigravity)",
+                "limit": { "context": 1000000, "output": 128000 }
+            },
+            "gemini-3.8-flash-tiered": {
+                "name": "Gemini 3.8 Flash (Antigravity)",
+                "limit": { "context": 1048576, "output": 65536 }
+            },
+            "gemini-3-flash": {
                 "name": "Gemini 3 Flash (Antigravity)",
                 "limit": { "context": 1048576, "output": 65536 }
             },
-            "antigravity-claude-sonnet-4-6": {
-                "name": "Claude Sonnet 4.6 (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
+            "gemini-3.1-flash-lite": {
+                "name": "Gemini 3.1 Flash Lite (Antigravity)",
+                "limit": { "context": 1048576, "output": 65535 }
             },
-            "antigravity-claude-sonnet-4-6-thinking-low": {
-                "name": "Claude Sonnet 4.6 Think Low (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
+            "antigravity-gemini-2.5-flash": {
+                "name": "Gemini 2.5 Flash (Antigravity)",
+                "limit": { "context": 1048576, "output": 65535 }
             },
-            "antigravity-claude-sonnet-4-6-thinking-medium": {
-                "name": "Claude Sonnet 4.6 Think Medium (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-sonnet-4-6-thinking-high": {
-                "name": "Claude Sonnet 4.6 Think High (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-sonnet-4-5": {
-                "name": "Claude Sonnet 4.5 (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-sonnet-4-5-thinking-low": {
-                "name": "Claude Sonnet 4.5 Think Low (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-sonnet-4-5-thinking-medium": {
-                "name": "Claude Sonnet 4.5 Think Medium (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-sonnet-4-5-thinking-high": {
-                "name": "Claude Sonnet 4.5 Think High (Antigravity)",
-                "limit": { "context": 200000, "output": 64000 }
-            },
-            "antigravity-claude-opus-4-6-thinking-low": {
-                "name": "Claude Opus 4.6 Think Low (Antigravity)",
-                "limit": { "context": 1000000, "output": 64000 }
-            },
-            "antigravity-claude-opus-4-6-thinking-medium": {
-                "name": "Claude Opus 4.6 Think Medium (Antigravity)",
-                "limit": { "context": 1000000, "output": 64000 }
-            },
-            "antigravity-claude-opus-4-6-thinking-high": {
-                "name": "Claude Opus 4.6 Think High (Antigravity)",
-                "limit": { "context": 1000000, "output": 64000 }
-            },
-            "gemini-2.5-flash": {
-                "name": "Gemini 2.5 Flash (CLI)",
-                "limit": { "context": 1048576, "output": 65536 }
-            },
-            "gemini-2.5-pro": {
-                "name": "Gemini 2.5 Pro (CLI)",
-                "limit": { "context": 1048576, "output": 65536 }
+            "gpt-oss-120b-medium": {
+                "name": "GPT-OSS 120B Medium (Antigravity)",
+                "limit": { "context": 131072, "output": 32768 }
             }
         }
     }
